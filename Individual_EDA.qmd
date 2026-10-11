@@ -1,0 +1,1411 @@
+---
+title: "PBS Utah Donor Individual EDA"
+author: "Kayli Thompson"
+format:
+  html:
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Section 1: Introduction and problem framing
+
+PBS Utah has turned to relying more heavily on donations since federal funding was rescinded in 2025.  Although many donors have generously contributed after the rescission, it has not been enough to offset the impact of losing federal funding.
+
+Given this major change in funding, PBS Utah needs a way to effectively identify and target potential donors to ensure it can continue operations without scaling back.
+
+This EDA explores synthetic data representing historical donations to PBS Utah. We check data cleanliness and quality and work to understand top predictors of donor behavior.
+
+### 1.2 Guiding Questions
+
+Specifically, we seek to answer the following questions:
+
+* Are there any data quality issues that need to be addressed before modeling?
+* How does donor demographics (e.g., age, gender, marital status) relate to donation behavior?
+* How does donor engagement (e.g., event attendance, campaign participation) relate to donation behavior?
+* How does donor PBS Utah viewing history relate to donation behavior?
+
+## Section 2: Data inventory and source audit
+
+This section loads the source files from GitHub, checks that the URLs resolve, and produces a basic data-quality audit before any joining or modeling.
+
+### 2.1 Load libraries
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(janitor)
+```
+
+### 2.2 Define source URLs
+
+The core datasets for this EDA are read directly from GitHub so the notebook is reproducible without local files.
+
+```{r}
+source_urls <- list(
+  constituents_w_memberships =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/constituents_w_memberships.csv",
+  unite_payments =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/unite_payments.csv",
+  team_approach_legacy_payments =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/team_approach_legacy_payments.csv",
+  passport_viewing =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/passport_viewing.csv",
+  cultivation =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/cultivation.csv",
+  campaign_codes =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/campaign_codes.csv",
+  campaign_members =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/campaign_members.csv",
+  soft_credits =
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/tables/soft_credits.csv"
+)
+
+source_urls
+```
+
+### 2.3 Validate URLs
+
+The GitHub CSVs for this project are LFS-backed, so we use the GitHub media endpoint as a fallback. This code checks whether a URL resolves and returns a usable first line.
+
+```{r}
+resolve_csv_url <- function(path) {
+  raw_url <- paste0(
+    "https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/",
+    path
+  )
+  media_url <- paste0(
+    "https://media.githubusercontent.com/media/jefftwebb/donor_prediction_capstone_project/main/",
+    path
+  )
+
+  raw_ok <- tryCatch({
+    hdr <- read_lines(raw_url, n_max = 1)
+    length(hdr) > 0 && !grepl("^version https://git-lfs.github.com/spec/v1$", hdr[1])
+  }, error = function(e) FALSE)
+
+  if (raw_ok) return(raw_url)
+
+  media_ok <- tryCatch({
+    hdr <- read_lines(media_url, n_max = 1)
+    length(hdr) > 0 && !grepl("^version https://git-lfs.github.com/spec/v1$", hdr[1])
+  }, error = function(e) FALSE)
+
+  if (media_ok) return(media_url)
+
+  NA_character_
+}
+
+fiscal_year_july <- function(date_vec) {
+  ifelse(
+    month(date_vec) >= 7,
+    year(date_vec) + 1L,
+    year(date_vec)
+  )
+}
+```
+
+### 2.4 Load datasets
+
+```{r}
+# Map each dataset name to the path on GitHub
+paths <- list(
+  constituents_w_memberships = "tables/constituents_w_memberships.csv",
+  unite_payments = "tables/unite_payments.csv",
+  team_approach_legacy_payments = "tables/team_approach_legacy_payments.csv",
+  passport_viewing = "tables/passport_viewing.csv",
+  cultivation = "tables/cultivation.csv",
+  campaign_codes = "tables/campaign_codes.csv",
+  campaign_members = "tables/campaign_members.csv",
+  soft_credits = "tables/soft_credits.csv"
+)
+
+resolved_urls <- tibble(
+  dataset = names(paths),
+  path = unlist(paths),
+  url = sapply(unlist(paths), resolve_csv_url)
+)
+
+resolved_urls
+```
+
+```{r}
+# Read the datasets that resolved successfully
+read_dataset <- function(dataset_name) {
+  url <- resolved_urls$url[resolved_urls$dataset == dataset_name]
+  if (is.na(url) || length(url) == 0) {
+    stop(paste("No valid URL found for:", dataset_name))
+  }
+  read_csv(url, show_col_types = FALSE)
+}
+
+constituents_w_memberships <- read_dataset("constituents_w_memberships")
+unite_payments <- read_dataset("unite_payments")
+team_approach_legacy_payments <- read_dataset("team_approach_legacy_payments")
+passport_viewing <- read_dataset("passport_viewing")
+cultivation <- read_dataset("cultivation")
+campaign_codes <- read_dataset("campaign_codes")
+campaign_members <- read_dataset("campaign_members")
+soft_credits <- read_dataset("soft_credits")
+```
+
+### 2.5 Audit: row counts and column counts
+
+```{r}
+# Now checking general structure of each dataset
+dataset_metadata <- tibble(
+  dataset = c(
+    "constituents_w_memberships",
+    "unite_payments",
+    "team_approach_legacy_payments",
+    "passport_viewing",
+    "cultivation",
+    "campaign_codes",
+    "campaign_members",
+    "soft_credits"
+  ),
+  n_rows = c(
+    nrow(constituents_w_memberships),
+    nrow(unite_payments),
+    nrow(team_approach_legacy_payments),
+    nrow(passport_viewing),
+    nrow(cultivation),
+    nrow(campaign_codes),
+    nrow(campaign_members),
+    nrow(soft_credits)
+  ),
+  n_cols = c(
+    ncol(constituents_w_memberships),
+    ncol(unite_payments),
+    ncol(team_approach_legacy_payments),
+    ncol(passport_viewing),
+    ncol(cultivation),
+    ncol(campaign_codes),
+    ncol(campaign_members),
+    ncol(soft_credits)
+  )
+)
+
+dataset_metadata
+```
+
+### 2.6 Audit: duplicate key checks
+
+This is a quick check for obvious primary-key problems. The exact “key” column depends on the file.
+
+```{r}
+key_checks <- tibble(
+  dataset = c(
+    "constituents_w_memberships",
+    "unite_payments",
+    "team_approach_legacy_payments",
+    "passport_viewing",
+    "campaign_codes",
+    "cultivation",
+    "campaign_members",
+    "soft_credits"
+  ),
+  key_col = c(
+    "Constituent ID",
+    "payment_id",
+    "ta_account_id",
+    "UID",
+    "Marketing Code",
+    NA_character_,
+    NA_character_,
+    "soft_credit_id"
+  ),
+  duplicate_key_rows = c(
+    sum(duplicated(constituents_w_memberships$`Constituent ID`)),
+    sum(duplicated(unite_payments$payment_id)),
+    sum(duplicated(team_approach_legacy_payments$ta_account_id)),
+    sum(duplicated(passport_viewing$UID)),
+    sum(duplicated(campaign_codes$`Marketing Code`)),
+    NA_integer_,
+    NA_integer_,
+    sum(duplicated(soft_credits$soft_credit_id), na.rm = TRUE)
+  )
+)
+
+key_checks
+```
+
+### 2.7 Audit: missing values by file
+
+```{r}
+missing_summary <- bind_rows(lapply(list(
+  constituents_w_memberships = constituents_w_memberships,
+  unite_payments = unite_payments,
+  team_approach_legacy_payments = team_approach_legacy_payments,
+  passport_viewing = passport_viewing,
+  cultivation = cultivation,
+  campaign_codes = campaign_codes,
+  campaign_members = campaign_members,
+  soft_credits = soft_credits
+), function(df) {
+  tibble(
+    dataset = deparse(substitute(df)),
+    column = names(df),
+    missing_n = sapply(df, function(x) sum(is.na(x))),
+    missing_pct = sapply(df, function(x) mean(is.na(x)))
+  )
+})) |>
+  filter(missing_n > 0) |>
+  arrange(dataset, desc(missing_pct))
+
+missing_summary
+```
+
+The missing-value audit shows that NA values are concentrated in a small set of columns rather than being uniformly distributed across all files. 
+
+* In `constituents_w_memberships`, the UofU-related fields `UofU Degree Info`, `Latest UofU Degree Year`, and `UofU Employment Status` are entirely missing in this extract, so they should be treated as unavailable rather than partially observed features. 
+* In `team_approach_legacy_payments`, several descriptive fields are also fully missing, including `source_description`, `county`, `program`, and the premium fields `premium_1_code`, `premium_1_name`, `premium_2_code`, `premium_2_name`, `premium_3_code`, and `premium_3_name`; these are therefore poor candidates for downstream analysis without outside documentation or replacement data. 
+* In `campaign_codes`, `Campaign Description` is fully missing, so it does not add usable explanatory detail beyond the other campaign lookup fields. 
+* In `campaign_members`, the response metadata fields `response_type` and `responded_date` have substantial missingness, which supports emphasizing higher-level indicators such as whether a response occurred rather than relying heavily on the more detailed response descriptors.
+
+### 2.8 Audit: blanks and whitespace-only strings
+
+```{r}
+blank_summary <- bind_rows(lapply(list(
+  constituents_w_memberships = constituents_w_memberships,
+  unite_payments = unite_payments,
+  team_approach_legacy_payments = team_approach_legacy_payments,
+  passport_viewing = passport_viewing,
+  cultivation = cultivation,
+  campaign_codes = campaign_codes,
+  campaign_members = campaign_members,
+  soft_credits = soft_credits
+), function(df) {
+  chr_cols <- names(df)[sapply(df, is.character)]
+  if (length(chr_cols) == 0) return(tibble())
+
+  tibble(
+    dataset = deparse(substitute(df)),
+    column = chr_cols,
+    blank_n = sapply(df[chr_cols], function(x) sum(str_trim(x) == "", na.rm = TRUE)),
+    whitespace_n = sapply(df[chr_cols], function(x) sum(str_detect(x, "^\\s+$"), na.rm = TRUE))
+  )
+})) |>
+  filter(blank_n > 0 | whitespace_n > 0) |>
+  arrange(dataset, desc(blank_n))
+
+blank_summary
+```
+
+The blank-string audit did not identify any character columns with notable counts of empty strings or whitespace-only entries. That suggests text missingness is being represented primarily with proper `NA` values instead of `""` placeholders, which simplifies later cleaning because no broad blank-to-NA recoding step appears necessary.
+
+### 2.9 Quick previews
+
+```{r}
+constituents_w_memberships |> head()
+unite_payments |> head()
+team_approach_legacy_payments |> head()
+passport_viewing |> head()
+cultivation |> head()
+campaign_codes |> head()
+campaign_members |> head()
+soft_credits |> head()
+```
+
+### 2.10 Data Description
+
+- `constituents_w_memberships` is the main constituent profile table.
+- `unite_payments` is the cleanest donation transaction table and is the benchmark format for this EDA.
+- `team_approach_legacy_payments` contains historical donation records and multiple potential constituent matches, so it will require careful cleaning and expansion before joining.
+- `passport_viewing` is movie/show-level viewing behavior and should be aggregated before joining to donor-level analytics.
+- `campaign_codes` is a lookup table for campaign metadata; it should be used to enrich donation data rather than treated as a transaction table.
+- `campaign_members` contains campaign response history; `responded_date` may not be reliable and should be used cautiously.
+- `cultivation` appears to be a portfolio/experimentation table with treatment assignment flags and adoption status.
+- `soft_credits` records donor attribution credits for gifts made by or on behalf of an entity constituent (e.g., donor advised fund) and should be included in the normalized payment/attribution base.
+
+## Section 3: Clean and normalize the payment and attribution tables
+
+This section builds the main payment base by combining:
+
+- Unite payments
+- Team Approach legacy payments expanded to one row per non-null constituent match
+- soft credits after removing orphan recipients without a constituent match
+
+The objective is a single long-form donor-payment table where each row represents a payment or attribution event tied to a constituent, not a household record.
+
+The raw GitHub URLs in this project are LFS-backed, so the resolver from Section 1 is used here to avoid reading the pointer files instead of the CSVs themselves.
+
+### 3.1 Clean and standardize the Unite payment table
+
+```{r}
+unite_clean <- unite_payments |>
+  mutate(
+    source_table = "unite",
+    source_payment_id = as.character(payment_id),
+    constituent_id = as.character(donor_id),
+    payment_date = as.Date(credit_date),
+    payment_amount = as.numeric(payment_amount),
+    payment_type = case_when(
+      tolower(trimws(tender_type)) %in% c("check", "money order") ~ "Check",
+      tolower(trimws(tender_type)) %in% c("credit card", "charge card") ~ "Credit Card",
+      tolower(trimws(tender_type)) == "eft" ~ "EFT",
+      tolower(trimws(tender_type)) == "payroll deduction" ~ "Payroll Deduction",
+      tolower(trimws(tender_type)) == "cash" ~ "Cash",
+      tolower(trimws(tender_type)) == "wire" ~ "Wire",
+      tolower(trimws(tender_type)) == "stock gift" ~ "Stock",
+      tolower(trimws(tender_type)) == "synthetic" ~ "Unknown",
+      TRUE ~ "Unknown"
+    ),
+    gift_kind = case_when(
+      tolower(trimws(pledge_gift_type)) %in% c("recurring", "sustaining") ~ "Recurring",
+      tolower(trimws(pledge_gift_type)) == "installment" ~ "Standard",
+      tolower(trimws(pledge_gift_type)) == "outright" ~ "Outright",
+      tolower(trimws(pledge_gift_type)) == "payroll" ~ "Payroll",
+      TRUE ~ NA_character_
+    ),
+    gift_type = case_when(
+      tolower(trimws(gift_type)) %in% c("new", "new sustainer") ~ "New",
+      tolower(trimws(gift_type)) %in% c("renew", "renewal") ~ "Renew",
+      tolower(trimws(gift_type)) %in% c("upgrade", "upgrade/reset") ~ "Upgrade",
+      tolower(trimws(gift_type)) %in% c("additional", "additional gift") ~ "Additional",
+      tolower(trimws(gift_type)) == "rejoin" ~ "Rejoin",
+      tolower(trimws(gift_type)) == "downgrade" ~ "Downgrade",
+      tolower(trimws(gift_type)) == "unhandled" ~ "Unhandled",
+      TRUE ~ NA_character_
+    ),
+    marketing_code = trimws(marketing_code),
+    campaign_name = case_when(
+      !is.na(campaign_name) & trimws(campaign_name) != "" ~ trimws(campaign_name),
+      TRUE ~ NA_character_
+    ),
+    source_description = as.character(campaign_name),
+    designation_detail_id = as.character(designation_detail_id),
+    opportunity_id = as.character(opportunity_id),
+    payment_frequency = as.character(payment_frequency),
+    donor_id = as.character(donor_id),
+    fiscal_year = fiscal_year_july(payment_date),
+    is_soft_credit = FALSE,
+    is_team_approach = FALSE,
+    is_unite = TRUE,
+    constituent_slot = NA_integer_
+  ) |>
+  select(
+    source_table,
+    source_payment_id,
+    constituent_id,
+    constituent_slot,
+    payment_date,
+    fiscal_year,
+    payment_amount,
+    payment_type,
+    gift_kind,
+    gift_type,
+    marketing_code,
+    campaign_name,
+    source_description,
+    designation_detail_id,
+    opportunity_id,
+    payment_frequency,
+    donor_id,
+    is_soft_credit,
+    is_team_approach,
+    is_unite
+  )
+
+unite_clean |> head()
+```
+
+### 3.2 Clean and expand the Team Approach legacy table
+
+Team Approach records are household-level and may have multiple possible constituent matches, so we expand them to one row per non-null constituent ID rather than collapsing to a single donor.
+
+```{r}
+team_expanded <- team_approach_legacy_payments |>
+  mutate(
+    across(c(
+      constituent_id_1,
+      constituent_id_2,
+      constituent_id_3,
+      constituent_id_4,
+      constituent_id_5,
+      constituent_id_6,
+      constituent_id_7
+    ), ~ as.character(.x))
+  ) |>
+  pivot_longer(
+    cols = starts_with("constituent_id_"),
+    names_to = "constituent_slot_raw",
+    names_pattern = "constituent_id_(\\d+)",
+    values_to = "constituent_id",
+    values_drop_na = TRUE
+  ) |>
+  mutate(
+    constituent_slot = as.integer(constituent_slot_raw),
+    source_table = "team_approach",
+    source_payment_id = as.character(ta_account_id),
+    payment_date = as.Date(gift_date),
+    payment_amount = as.numeric(payment_amount),
+    payment_type = case_when(
+      tolower(trimws(payment_method)) %in% c("charge card", "credit card") ~ "Credit Card",
+      tolower(trimws(payment_method)) == "payroll deduct" ~ "Payroll Deduction",
+      tolower(trimws(payment_method)) == "check" ~ "Check",
+      tolower(trimws(payment_method)) == "cash" ~ "Cash",
+      tolower(trimws(payment_method)) == "eft" ~ "EFT",
+      tolower(trimws(payment_method)) == "stock" ~ "Stock",
+      tolower(trimws(payment_method)) == "money order" ~ "Check",
+      TRUE ~ "Unknown"
+    ),
+    gift_kind = case_when(
+      tolower(trimws(gift_kind)) == "sustaining" ~ "Recurring",
+      tolower(trimws(gift_kind)) == "installment" ~ "Standard",
+      tolower(trimws(gift_kind)) == "one-time" ~ "Outright",
+      TRUE ~ gift_kind
+    ),
+    gift_type = case_when(
+      tolower(trimws(gift_type)) %in% c("new", "new sustainer") ~ "New",
+      tolower(trimws(gift_type)) %in% c("renew", "renewal") ~ "Renew",
+      tolower(trimws(gift_type)) %in% c("upgrade", "upgrade/reset") ~ "Upgrade",
+      tolower(trimws(gift_type)) %in% c("additional", "additional gift") ~ "Additional",
+      tolower(trimws(gift_type)) == "rejoin" ~ "Rejoin",
+      tolower(trimws(gift_type)) == "third-party" ~ "Third-Party",
+      TRUE ~ NA_character_
+    ),
+    marketing_code = trimws(source_code),
+    campaign_name = case_when(
+      !is.na(source_description) & trimws(source_description) != "" ~ trimws(source_description),
+      TRUE ~ NA_character_
+    ),
+    source_description = as.character(source_description),
+    designation_detail_id = NA_character_,
+    opportunity_id = NA_character_,
+    payment_frequency = NA_character_,
+    donor_id = constituent_id,
+    fiscal_year = fiscal_year_july(payment_date),
+    is_soft_credit = FALSE,
+    is_team_approach = TRUE,
+    is_unite = FALSE
+  ) |>
+  select(
+    source_table,
+    source_payment_id,
+    constituent_id,
+    constituent_slot,
+    payment_date,
+    fiscal_year,
+    payment_amount,
+    payment_type,
+    gift_kind,
+    gift_type,
+    marketing_code,
+    campaign_name,
+    source_description,
+    designation_detail_id,
+    opportunity_id,
+    payment_frequency,
+    donor_id,
+    is_soft_credit,
+    is_team_approach,
+    is_unite
+  )
+
+team_expanded |> head()
+```
+
+### 3.3 Clean the soft-credit table and remove orphan recipients
+
+The project documentation states that some soft-credit rows have no valid matching constituent and carry the synthetic ID `SYN-ORPHAN`. Those rows are not useful for the donor analysis and should be removed here.
+
+```{r}
+soft_credits_clean <- soft_credits |>
+  rename(
+    soft_credit_id = `Credit ID`,
+    designation_detail_id = `Designation Detail ID`,
+    soft_credit_constituent_id = `Soft Credit Constituent ID`,
+    hard_credit_org_id = `Hard Credit Org ID`,
+    hard_credit_org_type = `Hard Credit Org Type`,
+    credit_gift_type = `Credit Gift Type`,
+    payment_amount = `Credit Amount`,
+    payment_date = `Credit Date`,
+    credit_type = `Credit Type`
+  ) |>
+  filter(
+    !is.na(soft_credit_constituent_id),
+    !str_detect(soft_credit_constituent_id, "SYN-ORPHAN")
+  ) |>
+  distinct() |>
+  mutate(
+    source_table = "soft_credit",
+    source_payment_id = as.character(soft_credit_id),
+    constituent_id = as.character(soft_credit_constituent_id),
+    constituent_slot = NA_integer_,
+    payment_date = as.Date(payment_date),
+    payment_amount = as.numeric(payment_amount),
+    payment_type = case_when(
+      tolower(trimws(credit_type)) %in% c("cash", "hard credit", "soft") ~ "Cash",
+      tolower(trimws(credit_type)) == "check" ~ "Check",
+      tolower(trimws(credit_type)) == "credit card" ~ "Credit Card",
+      TRUE ~ "Unknown"
+    ),
+    gift_kind = case_when(
+      tolower(trimws(credit_gift_type)) %in% c("recurring", "sustaining") ~ "Recurring",
+      tolower(trimws(credit_gift_type)) == "installment" ~ "Standard",
+      TRUE ~ NA_character_
+    ),
+    gift_type = case_when(
+      tolower(trimws(credit_gift_type)) %in% c("new", "new gift") ~ "New",
+      tolower(trimws(credit_gift_type)) %in% c("renew", "renewal") ~ "Renew",
+      tolower(trimws(credit_gift_type)) %in% c("upgrade", "upgrade/reset") ~ "Upgrade",
+      tolower(trimws(credit_gift_type)) %in% c("additional", "additional gift") ~ "Additional",
+      TRUE ~ NA_character_
+    ),
+    marketing_code = NA_character_,
+    campaign_name = NA_character_,
+    source_description = NA_character_,
+    designation_detail_id = as.character(designation_detail_id),
+    opportunity_id = NA_character_,
+    payment_frequency = NA_character_,
+    donor_id = constituent_id,
+    fiscal_year = fiscal_year_july(payment_date),
+    is_soft_credit = TRUE,
+    is_team_approach = FALSE,
+    is_unite = FALSE
+  ) |>
+  select(
+    source_table,
+    source_payment_id,
+    constituent_id,
+    constituent_slot,
+    payment_date,
+    fiscal_year,
+    payment_amount,
+    payment_type,
+    gift_kind,
+    gift_type,
+    marketing_code,
+    campaign_name,
+    source_description,
+    designation_detail_id,
+    opportunity_id,
+    payment_frequency,
+    donor_id,
+    is_soft_credit,
+    is_team_approach,
+    is_unite
+  )
+
+soft_credits_clean |> head()
+```
+
+### 3.4 Combine the cleaned payment sources into a single base table
+
+```{r}
+base_payment_columns <- c(
+  "source_table",
+  "source_payment_id",
+  "constituent_id",
+  "constituent_slot",
+  "payment_date",
+  "fiscal_year",
+  "payment_amount",
+  "payment_type",
+  "gift_kind",
+  "gift_type",
+  "marketing_code",
+  "campaign_name",
+  "source_description",
+  "designation_detail_id",
+  "opportunity_id",
+  "payment_frequency",
+  "donor_id",
+  "is_soft_credit",
+  "is_team_approach",
+  "is_unite"
+)
+
+combined_payment_base <- bind_rows(
+  unite_clean |> select(all_of(base_payment_columns)),
+  team_expanded |> select(all_of(base_payment_columns)),
+  soft_credits_clean |> select(all_of(base_payment_columns))
+) |>
+  mutate(
+    payment_row_id = row_number(),
+    payment_amount = as.numeric(payment_amount),
+    source_table = factor(source_table, levels = c("unite", "team_approach", "soft_credit"))
+  ) |>
+  arrange(source_table, payment_date, constituent_id)
+
+combined_payment_base |> head()
+```
+
+### 3.5 Double check the combined payment base
+
+```{r}
+combined_payment_base |>
+  count(source_table, name = "n_rows")
+
+combined_payment_base |>
+  summarize(
+    n_rows = n(),
+    n_unique_constituents = n_distinct(constituent_id),
+    total_amount = sum(payment_amount, na.rm = TRUE),
+    median_amount = median(payment_amount, na.rm = TRUE)
+  )
+
+combined_payment_base |>
+  count(is.na(constituent_id), name = "n_rows")
+
+combined_payment_base |>
+  count(is_soft_credit, is_team_approach, is_unite)
+```
+
+At this point, the payment and attribution tables have been normalized into a single long-form base table. The next section will aggregate this payment base to a constituent-month or constituent-fiscal-year analytic frame before joining in passport viewing, cultivation, campaign assignment, and constituent profile features.
+
+## Section 4: Enrichment table audit and normalization
+
+This section audits the non-transaction enrichment tables before they are joined onto the normalized payment base. The goal is to confirm each file's key structure and data quality issues so the join logic reflects the real business meaning of the data.
+
+### 4.1 Passport viewing audit
+
+`passport_viewing` is a constituent-year-genre table, not a payment table. It records viewing behavior only for years where a view occurred, and it does not distinguish between "no viewing" and "no account or no consent".
+
+```{r}
+passport_viewing |>
+  count(fiscal_year, name = "n_rows")
+
+passport_viewing |>
+  summarise(
+    n_rows = n(),
+    n_unique_constituents = n_distinct(constituent_id),
+    n_unique_years = n_distinct(fiscal_year),
+    n_unique_genres = n_distinct(genre)
+  )
+
+passport_viewing |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(n_genre_rows = n(), .groups = "drop") |>
+  count(n_genre_rows)
+
+passport_viewing |>
+  summary()
+```
+
+```{r}
+passport_viewing_clean <- passport_viewing |>
+  rename(
+    titles_viewed = `titles_viewed`,
+    mean_percent_watched = `mean_percent_watched`
+  ) |>
+  mutate(
+    fiscal_year = as.integer(fiscal_year),
+    titles_viewed = as.integer(titles_viewed),
+    mean_percent_watched = as.numeric(mean_percent_watched),
+    viewing_row = 1L
+  ) |>
+  group_by(constituent_id, fiscal_year, genre) |>
+  summarise(
+    titles_viewed = sum(titles_viewed, na.rm = TRUE),
+    mean_percent_watched = mean(mean_percent_watched, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+passport_viewing_clean |> head()
+```
+
+Key interpretation: passport viewing should be aggregated to constituent-year or constituent-year-genre before joining, rather than used as a raw event table.
+
+### 4.2 Cultivation audit
+
+`cultivation` is a constituent-year treatment table. It contains portfolio assignments and assigned treatment flags, so it should be treated as a donor-year feature matrix rather than a payment table.
+
+```{r}
+cultivation |>
+  count(fiscal_year, name = "n_rows")
+
+cultivation |>
+  summarise(
+    n_rows = n(),
+    n_unique_constituents = n_distinct(synthetic_id),
+    n_unique_years = n_distinct(fiscal_year),
+    selected_n = sum(selected, na.rm = TRUE),
+    contacted_n = sum(contacted, na.rm = TRUE),
+    holdout_n = sum(holdout, na.rm = TRUE),
+    program_adopted_n = sum(program_adopted, na.rm = TRUE)
+  )
+
+cultivation |>
+  mutate(
+    contacted_and_holdout = contacted & holdout,
+    selected_but_not_contacted = selected & !contacted,
+    contacted_but_not_selected = contacted & !selected
+  ) |>
+  summarise(
+    contacted_and_holdout = sum(contacted_and_holdout, na.rm = TRUE),
+    selected_but_not_contacted = sum(selected_but_not_contacted, na.rm = TRUE),
+    contacted_but_not_selected = sum(contacted_but_not_selected, na.rm = TRUE)
+  )
+```
+
+```{r}
+cultivation_clean <- cultivation |>
+  rename(constituent_id = synthetic_id) |>
+  mutate(
+    constituent_id = as.character(constituent_id),
+    fiscal_year = as.integer(fiscal_year),
+    selected = as.logical(selected),
+    contacted = as.logical(contacted),
+    holdout = as.logical(holdout),
+    program_adopted = as.logical(program_adopted)
+  )
+
+cultivation_clean |> head()
+```
+
+Key interpretation: `selected`, `contacted`, `holdout`, and `program_adopted` are all year-specific treatment variables and should be joined on constituent-year.
+
+### 4.3 Campaign membership audit
+
+`campaign_members` contains campaign membership and response tracking. The project notes that `responded_date` and `response_type` are less accurate and should be treated cautiously; `responded` is more reliable than the specific response metadata.
+
+```{r}
+campaign_members |>
+  summarise(
+    n_rows = n(),
+    n_unique_constituents = n_distinct(constituent_id),
+    n_unique_codes = n_distinct(marketing_code),
+    responded_n = sum(responded, na.rm = TRUE),
+    response_type_missing = sum(is.na(response_type)),
+    responded_date_missing = sum(is.na(responded_date))
+  )
+
+campaign_members |>
+  count(response_type, sort = TRUE)
+
+campaign_members |>
+  filter(responded == TRUE) |>
+  summarise(
+    n_responding_rows = n(),
+    n_unique_constituents = n_distinct(constituent_id),
+    median_response_date = median(as.Date(responded_date), na.rm = TRUE)
+  )
+```
+
+```{r}
+campaign_members_clean <- campaign_members |>
+  mutate(
+    constituent_id = as.character(constituent_id),
+    responded = as.logical(responded),
+    indirect_response = as.logical(indirect_response),
+    campaign_start_date = as.Date(campaign_start_date),
+    responded_date = as.Date(responded_date),
+    marketing_code = trimws(marketing_code),
+    campaign_name = trimws(campaign_name)
+  )
+
+campaign_codes_clean <- campaign_codes |>
+  rename(marketing_code = `Marketing Code`) |>
+  mutate(
+    marketing_code = trimws(marketing_code),
+    `Campaign Type` = as.character(`Campaign Type`),
+    `Communication Method` = as.character(`Communication Method`),
+    Active = as.logical(Active)
+  )
+
+campaign_members_clean |> head()
+campaign_codes_clean |> head()
+```
+
+Key interpretation: `campaign_members` is a campaign assignment table, not a payment table. The more reliable feature is whether a constituent responded in a campaign year; `response_type` and `responded_date` should be used as supplemental checks, not as canonical timing fields. The `Campaign Type` lookup from `campaign_codes` provides a useful categorical description of the campaign channel or effort.
+
+### 4.4 Constituent profile feature audit
+
+The main profile table is `constituents_w_memberships`. This is the person-level snapshot table and the primary source for constituent features.
+
+```{r}
+constituents_w_memberships |>
+  summarise(
+    n_rows = n(),
+    n_unique_constituents = n_distinct(`Constituent ID`),
+    n_missing_age = sum(is.na(Age)),
+    n_missing_gender = sum(is.na(Gender)),
+    n_missing_major_class = sum(is.na(`Major Donor Class PBS Utah`)),
+    n_missing_sustainer = sum(is.na(`Sustainer PBS Utah`))
+  )
+
+constituents_w_memberships |>
+  count(Gender, sort = TRUE)
+
+constituents_w_memberships |>
+  count(`Major Donor Class PBS Utah`, sort = TRUE)
+
+constituents_w_memberships |>
+  count(`Sustainer PBS Utah`, sort = TRUE)
+```
+
+```{r}
+constituent_profile_clean <- constituents_w_memberships |>
+  rename(constituent_id = `Constituent ID`) |>
+  mutate(
+    constituent_id = as.character(constituent_id),
+    Age = as.integer(Age),
+    Gender = as.character(Gender),
+    `Sustainer PBS Utah` = as.logical(`Sustainer PBS Utah`),
+    `Legacy Circle Member PBS Utah` = as.logical(`Legacy Circle Member PBS Utah`),
+    `Has UofU Legacy Gift` = as.logical(`Has UofU Legacy Gift`),
+    `Major Donor Class PBS Utah` = as.character(`Major Donor Class PBS Utah`),
+    `Marital Status` = case_when(
+      is.na(`Marital Status`) ~ "Unknown",
+      TRUE ~ as.character(`Marital Status`)
+    )
+  )
+
+constituent_profile_clean |> head()
+```
+
+This is the person-level snapshot table and should be joined on `constituent_id` without treating it as a transaction table.
+
+### 4.5 Enrichment join design
+
+Before making a final analytic frame, each enrichment table should be checked for its canonical key:
+
+- `constituent_profile_clean`: one row per constituent, joined on `constituent_id`
+- `cultivation_clean`: one row per constituent-year, joined on `constituent_id` + `fiscal_year`
+- `passport_viewing_clean`: one row per constituent-year-genre, aggregated to `constituent_id` + `fiscal_year` if needed
+- `campaign_members_clean`: one row per constituent-campaign assignment, joined by `constituent_id` and `marketing_code` when needed
+- `campaign_codes`: lookup table, joined on `Marketing Code`
+
+This section establishes the normalization rules for the later enrichment stage. The cleaned payment base is now ready for aggregation to donor-year or donor-month frames before joining these features in.
+
+## Section 5: Build the constituent-year donor frame
+
+This section aggregates the cleaned payment base to the donor-year structure. The resulting table is the main analytic frame for the later joins to profile, cultivation, campaign, and passport features.
+
+### 5.1 Aggregate the payment base to constituent-year totals
+
+```{r}
+donor_year <- combined_payment_base |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(
+    total_giving = sum(payment_amount, na.rm = TRUE),
+    total_hard_giving = sum(payment_amount[!is_soft_credit], na.rm = TRUE),
+    total_soft_credit = sum(payment_amount[is_soft_credit], na.rm = TRUE),
+    n_payment_rows = n(),
+    n_hard_gift_rows = sum(!is_soft_credit, na.rm = TRUE),
+    n_soft_credit_rows = sum(is_soft_credit, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    has_activity = total_giving > 0,
+    giving_flag = ifelse(total_giving > 0, 1L, 0L)
+  ) |>
+  arrange(constituent_id, fiscal_year)
+
+donor_year |> head()
+```
+
+This is the main person-year analytic frame. Each row is one constituent in one fiscal year, with total giving, total soft credits, and gift counts.
+
+### 5.2 Optional monthly donor frame for more granular time models
+
+If a month-level analysis is needed later, the same payment base can be aggregated to constituent-month instead of constituent-year. This is useful for time-series views, campaigns, or donor movement over calendar time.
+
+```{r}
+donor_month <- combined_payment_base |>
+  mutate(
+    year_month = floor_date(payment_date, "month")
+  ) |>
+  group_by(constituent_id, year_month) |>
+  summarise(
+    total_giving = sum(payment_amount, na.rm = TRUE),
+    n_payment_rows = n(),
+    .groups = "drop"
+  ) |>
+  arrange(constituent_id, year_month)
+
+donor_month |> head()
+```
+
+For the main EDA, the donor-year frame is the cleaner unit because the project data dictionary and enrichment tables are defined on a fiscal-year basis.
+
+### 5.3 Join the annual donor frame to constituent profile features
+
+The constituent profile table is the main person-level descriptor and should be joined to the annual donor frame on `constituent_id`.
+
+```{r}
+donor_year_profile <- donor_year |>
+  left_join(
+    constituent_profile_clean |>
+      select(
+        constituent_id,
+        Age,
+        Gender,
+        `Annual Giving Group`,
+        `Major Donor Class PBS Utah`,
+        `Sustainer PBS Utah`,
+        `Address ZIP`,
+        `Address City`,
+        `UofU Degree Count`,
+        `Latest UofU Degree Year`,
+        `Legacy Circle Member PBS Utah`,
+        `Lifetime UofU Fundraising`,
+        `Marital Status`,
+        `Has UofU Legacy Gift`
+      ),
+    by = "constituent_id"
+  )
+
+donor_year_profile |> head()
+```
+
+### 5.4 Join cultivation and campaign membership
+
+The cultivation table is year-specific and should join on `constituent_id` + `fiscal_year`. Campaign membership is best handled at the constituent-campaign level, but for donor-year summaries it can be summarized to constituent-year responses.
+
+```{r}
+campaign_year_summary <- campaign_members_clean |>
+  left_join(
+    campaign_codes_clean |>
+      select(marketing_code, `Campaign Type`, `Communication Method`, Active),
+    by = "marketing_code"
+  ) |>
+  mutate(fiscal_year = fiscal_year_july(campaign_start_date)) |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(
+    campaign_count = n(),
+    responded_count = sum(responded, na.rm = TRUE),
+    responded_any = as.integer(any(responded, na.rm = TRUE)),
+    indirect_response_any = as.integer(any(indirect_response, na.rm = TRUE)),
+    campaign_type_count = n_distinct(`Campaign Type`, na.rm = TRUE),
+    campaign_type_primary = ifelse(
+      n_distinct(`Campaign Type`, na.rm = TRUE) > 0,
+      first(sort(unique(na.omit(`Campaign Type`)))),
+      "None"
+    ),
+    communication_method_primary = ifelse(
+      n_distinct(`Communication Method`, na.rm = TRUE) > 0,
+      first(sort(unique(na.omit(`Communication Method`)))),
+      "None"
+    ),
+    .groups = "drop"
+  )
+
+# Merge cultivation and campaign activity into the annual frame
+analytical_donor_year <- donor_year_profile |>
+  left_join(
+    cultivation_clean,
+    by = c("constituent_id", "fiscal_year")
+  ) |>
+  left_join(
+    campaign_year_summary,
+    by = c("constituent_id", "fiscal_year")
+  )
+
+analytical_donor_year |> head()
+```
+
+### 5.5 Add passport viewing at the donor-year level
+
+The raw passport table is a constituent-year-genre table. For a person-year donor model, it is often simplest to aggregate it to the constituent-year level before joining.
+
+```{r}
+passport_year_summary <- passport_viewing_clean |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(
+    total_titles_viewed = sum(titles_viewed, na.rm = TRUE),
+    avg_percent_watched = mean(mean_percent_watched, na.rm = TRUE),
+    n_genres_viewed = n_distinct(genre),
+    genres_viewed = paste(sort(unique(genre)), collapse = "; "),
+    .groups = "drop"
+  )
+
+analytical_donor_year <- analytical_donor_year |>
+  left_join(
+    passport_year_summary,
+    by = c("constituent_id", "fiscal_year")
+  )
+
+analytical_donor_year |> head()
+```
+
+### 5.6 Create a clean exploratory donor-year dataset
+
+```{r}
+exploratory_donor_year <- analytical_donor_year |>
+  mutate(
+    fiscal_year = as.integer(fiscal_year),
+    total_giving = replace_na(total_giving, 0),
+    total_soft_credit = replace_na(total_soft_credit, 0),
+    responded_any = replace_na(responded_any, 0),
+    indirect_response_any = replace_na(indirect_response_any, 0),
+    selected = replace_na(selected, FALSE),
+    contacted = replace_na(contacted, FALSE),
+    holdout = replace_na(holdout, FALSE),
+    program_adopted = replace_na(program_adopted, FALSE),
+    total_titles_viewed = replace_na(total_titles_viewed, 0),
+    avg_percent_watched = replace_na(avg_percent_watched, 0),
+    n_genres_viewed = replace_na(n_genres_viewed, 0),
+    campaign_type_count = replace_na(campaign_type_count, 0),
+    campaign_type_primary = replace_na(campaign_type_primary, "None"),
+    communication_method_primary = replace_na(communication_method_primary, "None"),
+    `Sustainer PBS Utah` = replace_na(`Sustainer PBS Utah`, FALSE),
+    `Has UofU Legacy Gift` = replace_na(`Has UofU Legacy Gift`, FALSE),
+    `Marital Status` = replace_na(`Marital Status`, "Unknown"),
+    `Major Donor Class PBS Utah` = as.factor(`Major Donor Class PBS Utah`),
+    Gender = as.factor(Gender),
+    `Annual Giving Group` = as.factor(`Annual Giving Group`),
+    `Sustainer PBS Utah` = as.logical(`Sustainer PBS Utah`),
+    `Has UofU Legacy Gift` = as.logical(`Has UofU Legacy Gift`)
+  )
+
+exploratory_donor_year |> head()
+```
+
+This donor-year frame retains both the annual viewing totals and a compact genre summary for each person-year, so a donor who watched multiple genres in a fiscal year will show a concatenated string like `Drama; History` rather than losing that information entirely.
+
+This donor-year frame is now the core analytic dataset for the EDA. It keeps the data at a coherent level: one row per constituent per fiscal year, with giving, profile, treatment, campaign, and viewing features aligned to that same unit.
+
+The next stage is to explore relationships and patterns in this donor-year frame with descriptive charts and diagnostics.
+
+## Section 6: Guiding Question 1 — Data quality issues before modeling
+
+Before the descriptive EDA, it is useful to check the donor-year analytic frame for missingness and outliers. This helps distinguish genuine donor behavior from data-quality artifacts and avoids over-interpreting extremes.
+
+### 6.1 Missingness audit
+
+```{r}
+missing_by_column <- exploratory_donor_year |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "missing_n") |>
+  arrange(desc(missing_n))
+
+missing_by_column
+```
+
+### 6.2 Outlier audit for numeric giving and engagement variables
+
+```{r}
+outlier_summary <- exploratory_donor_year |>
+  summarise(
+    total_giving_p99 = quantile(total_giving, 0.99, na.rm = TRUE),
+    total_giving_p999 = quantile(total_giving, 0.999, na.rm = TRUE),
+    total_titles_viewed_p99 = quantile(total_titles_viewed, 0.99, na.rm = TRUE),
+    age_p99 = quantile(Age, 0.99, na.rm = TRUE)
+  )
+
+outlier_summary
+```
+
+```{r}
+exploratory_donor_year |>
+  ggplot(aes(x = total_giving)) +
+  geom_histogram(bins = 60, color = "white") +
+  scale_x_continuous(labels = scales::dollar_format(), limits = c(0, quantile(exploratory_donor_year$total_giving, 0.99, na.rm = TRUE))) +
+  labs(
+    title = "Giving distribution: 99th Percentile",
+    x = "Total giving",
+    y = "Number of constituent-years"
+  )
+```
+
+```{r}
+exploratory_donor_year |>
+  filter(total_giving > 0) |>
+  mutate(top_1pct = total_giving > quantile(total_giving, 0.99, na.rm = TRUE)) |>
+  ggplot(aes(x = top_1pct, y = total_giving)) +
+  geom_boxplot(width = 0.5) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Top 1% giving vs. rest of positive giving distribution",
+    x = "Top 1% annual giving",
+    y = "Total giving"
+  )
+```
+
+This audit helps separate routine donor behavior from a small set of unusually high-giving or highly engaged observations. Outliers are not automatically errors, but they should be checked before any interpretation or modeling.
+
+Missing-data handling decision for this EDA: structural missingness is accepted rather than imputed. In particular, `Major Donor Class PBS Utah` is retained with missing values as-is because the missing share is substantial and dropping those rows would distort the donor-year frame. The 18 donor-year records with missing `Age` and `Gender` are removed from the demographic visualizations in Section 7 because those two variables are central to the question being asked and the missing count is small enough to exclude without materially changing the analytic frame. `Annual Giving Group` is kept with its missing values and interpreted using NA-aware summaries because it is not the focus of the demographics section and it still helps preserve donor-year coverage.
+
+## Section 7: Guiding Questions 2–4 — Relationships with donation behavior
+
+This section begins the descriptive exploration of the final donor-year analytical frame. The goal is to understand distributions, key relationships, and where the strongest donor patterns appear before moving into deeper modeling or inference.
+
+### 7.1 Baseline context — Distribution of annual giving
+
+```{r}
+exploratory_donor_year |>
+  ggplot(aes(x = total_giving)) +
+  geom_histogram(bins = 40, color = "white") +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Distribution of annual giving",
+    x = "Total giving in fiscal year",
+    y = "Number of constituent-years"
+  )
+
+exploratory_donor_year |>
+  ggplot(aes(x = total_giving)) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving distribution (log scale)",
+    x = "Total giving in fiscal year",
+    y = "Density"
+  )
+```
+
+These baseline distribution charts show that annual giving is strongly right-skewed: most constituent-years are concentrated at relatively low giving levels, while a smaller number of observations extend into a long high-giving tail. The log-scale density view helps reveal structure in the main mass of the distribution that is compressed on the raw-dollar scale. This pattern supports using robust summaries (especially medians and donor rates) in later subgroup comparisons and interpreting mean differences cautiously because they can be influenced by a small number of high-giving constituent-years.
+
+### 7.2 Guiding Question 2 — Donor demographics and donation behavior (tables and visualizations)
+
+```{r}
+exploratory_donor_year |>
+  filter(!is.na(Age), !is.na(Gender)) |>
+  group_by(Gender) |>
+  summarise(
+    donor_rate = mean(total_giving > 0, na.rm = TRUE),
+    avg_giving = mean(total_giving, na.rm = TRUE),
+    median_giving = median(total_giving, na.rm = TRUE),
+    q3_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(donor_rate)) |>
+  knitr::kable(digits = 2)
+
+exploratory_donor_year |>
+  filter(!is.na(Age), !is.na(Gender)) |>
+  group_by(`Marital Status`) |>
+  summarise(
+    donor_rate = mean(total_giving > 0, na.rm = TRUE),
+    avg_giving = mean(total_giving, na.rm = TRUE),
+    median_giving = median(total_giving, na.rm = TRUE),
+    q3_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(donor_rate)) |>
+  knitr::kable(digits = 2)
+
+exploratory_donor_year |>
+  filter(!is.na(Age), !is.na(Gender)) |>
+  mutate(age_band = cut(
+    Age,
+    breaks = c(0, 25, 35, 45, 55, 65, 75, Inf),
+    labels = c("18-24", "25-34", "35-44", "45-54", "55-64", "65-74", "75+"),
+    right = FALSE
+  )) |>
+  group_by(age_band) |>
+  summarise(
+    donor_rate = mean(total_giving > 0, na.rm = TRUE),
+    avg_giving = mean(total_giving, na.rm = TRUE),
+    median_giving = median(total_giving, na.rm = TRUE),
+    q3_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(age_band) |>
+  knitr::kable(digits = 2)
+
+exploratory_donor_year |>
+  filter(!is.na(Age), !is.na(Gender)) |>
+  filter(total_giving > 0) |>
+  ggplot(aes(x = Gender, y = total_giving)) +
+  geom_boxplot(width = 0.5) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving by gender",
+    x = "Gender",
+    y = "Total giving"
+  )
+
+exploratory_donor_year |>
+  filter(!is.na(Age), !is.na(Gender)) |>
+  filter(total_giving > 0) |>
+  ggplot(aes(x = `Marital Status`, y = total_giving)) +
+  geom_boxplot(width = 0.5) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving by marital status",
+    x = "Marital status",
+    y = "Total giving"
+  )
+
+exploratory_donor_year |>
+  filter(!is.na(Age), !is.na(Gender)) |>
+  filter(total_giving > 0) |>
+  mutate(age_band = cut(
+    Age,
+    breaks = c(0, 25, 35, 45, 55, 65, 75, Inf),
+    labels = c("18-24", "25-34", "35-44", "45-54", "55-64", "65-74", "75+"),
+    right = FALSE
+  )) |>
+  ggplot(aes(x = age_band, y = total_giving)) +
+  geom_boxplot(width = 0.5) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving by age band",
+    x = "Age band",
+    y = "Total giving"
+  )
+```
+
+Across demographic groups, giving remains strongly right-skewed, so median giving and donor-rate comparisons are generally more stable than mean-only comparisons. The tables and boxplots suggest some demographic differences in distribution shape and central tendency, but the overlap is still substantial, which means demographics alone are unlikely to explain most of the variation in donation behavior. Because the rows with missing `Age` and `Gender` were removed from these visualizations, and the boxplots now focus only on positive-giving constituent-years, these charts are best read as a view of observed donors rather than the full donor-year frame.
+
+### 7.3 Guiding Question 3 — Donor engagement and donation behavior (tables and visualizations)
+
+```{r}
+exploratory_donor_year |>
+  group_by(responded_any) |>
+  summarise(
+    donor_rate = mean(total_giving > 0, na.rm = TRUE),
+    avg_giving = mean(total_giving, na.rm = TRUE),
+    median_giving = median(total_giving, na.rm = TRUE),
+    q3_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  knitr::kable(digits = 2)
+
+exploratory_donor_year |>
+  group_by(campaign_type_primary) |>
+  summarise(
+    donor_rate = mean(total_giving > 0, na.rm = TRUE),
+    avg_giving = mean(total_giving, na.rm = TRUE),
+    median_giving = median(total_giving, na.rm = TRUE),
+    q3_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(donor_rate)) |>
+  knitr::kable(digits = 2)
+
+exploratory_donor_year |>
+  filter(total_giving > 0) |>
+  ggplot(aes(x = as.factor(responded_any), y = total_giving)) +
+  geom_boxplot(width = 0.5) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving by campaign response indicator",
+    x = "Responded in fiscal year",
+    y = "Total giving"
+  )
+
+exploratory_donor_year |>
+  filter(total_giving > 0) |>
+  ggplot(aes(x = campaign_type_primary, y = total_giving)) +
+  geom_boxplot(width = 0.5) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving by campaign type",
+    x = "Primary campaign type",
+    y = "Total giving"
+  )
+```
+
+These engagement results suggest that giving remains highly right-skewed within campaign groups, so medians and donor rates are generally more stable summaries than raw means. The response indicator and campaign-type splits show visible differences in giving distributions among donors, but they should be interpreted as associations rather than direct causal effects of campaign activity.
+
+### 7.4 Guiding Question 4 — PBS Utah viewing history and donation behavior
+
+The genre table below provides an all-time viewing-history lens by genre. It aggregates across years and summarizes how giving varies across the PBS Utah content categories that constituents viewed, using mean and median giving so the table is easy to compare across genres.
+
+```{r}
+passport_viewing_clean |>
+  left_join(
+    exploratory_donor_year |>
+      select(constituent_id, fiscal_year, total_giving),
+    by = c("constituent_id", "fiscal_year")
+  ) |>
+  separate_rows(genre, sep = ";\\s*") |>
+  group_by(genre) |>
+  summarise(
+    n_constituent_year_genre_rows = n(),
+    mean_total_giving = mean(total_giving, na.rm = TRUE),
+    median_total_giving = median(total_giving, na.rm = TRUE),
+    q3_total_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mean_total_giving)) |>
+  knitr::kable(digits = 2)
+```
+
+The genre summary below uses the merged donor-year + viewing data, so a constituent-year can appear more than once if that donor-year included multiple genres. That duplication is intentional here: the goal is to compare giving patterns across all viewing rows associated with each genre, not to force a one-row-per-donor-year structure. Zero-giving donor-years are kept in the table so the summaries reflect the full viewing population rather than only donors.
+
+```{r}
+passport_viewing_clean |>
+  left_join(
+    exploratory_donor_year |>
+      select(constituent_id, fiscal_year, total_giving),
+    by = c("constituent_id", "fiscal_year")
+  ) |>
+  filter(total_giving > 0) |>
+  separate_rows(genre, sep = ";\\s*") |>
+  group_by(genre) |>
+  summarise(
+    n_constituent_year_genre_rows = n(),
+    mean_total_giving = mean(total_giving, na.rm = TRUE),
+    median_total_giving = median(total_giving, na.rm = TRUE),
+    q3_total_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mean_total_giving)) |>
+  knitr::kable(digits = 2)
+```
+
+This second genre table answers a narrower question: among constituent-years with positive giving, what does giving look like by genre? It removes zero-giving rows so the averages and medians describe donors only, which can be useful for comparing donation intensity across genres after removing the non-donor mass.
+
+```{r}
+exploratory_donor_year |>
+  slice_sample(prop = 0.1) |>
+  ggplot(aes(x = total_titles_viewed, y = total_giving)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_x_continuous(labels = scales::label_number()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Annual giving vs. total titles viewed",
+    x = "Total titles viewed",
+    y = "Total giving"
+  )
+```
+
+The scatter plot above was heavily skewed due to high level donors. Filtering to the 99th percentile did not give a much clearer view and was not included here. Instead, the binned table below summarizes giving behavior across levels of PBS Utah viewing activity, which is easier to read and better aligned with the observed skew in the data.
+
+```{r}
+
+exploratory_donor_year |>
+  mutate(
+    titles_viewed_bin = case_when(
+      total_titles_viewed == 0 ~ "0",
+      total_titles_viewed >= 1 & total_titles_viewed <= 5 ~ "1-5",
+      total_titles_viewed >= 6 & total_titles_viewed <= 10 ~ "6-10",
+      total_titles_viewed >= 11 & total_titles_viewed <= 20 ~ "11-20",
+      total_titles_viewed >= 21 & total_titles_viewed <= 50 ~ "21-50",
+      total_titles_viewed >= 51 & total_titles_viewed <= 100 ~ "51-100",
+      total_titles_viewed > 100 ~ "100+",
+      TRUE ~ NA_character_
+    ),
+    titles_viewed_bin = factor(
+      titles_viewed_bin,
+      levels = c("0", "1-5", "6-10", "11-20", "21-50", "51-100", "100+")
+    )
+  ) |>
+  group_by(titles_viewed_bin) |>
+  summarise(
+    n_constituent_years = n(),
+    avg_total_giving = mean(total_giving, na.rm = TRUE),
+    median_total_giving = median(total_giving, na.rm = TRUE),
+    q3_total_giving = quantile(total_giving, 0.75, na.rm = TRUE),
+    pct_with_positive_giving = mean(total_giving > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    pct_with_positive_giving = scales::percent(pct_with_positive_giving, accuracy = 0.1)
+  ) |>
+  knitr::kable()
+```
+
+While there seems to be little relationship between total titles viewed and total giving, there is a clear trend in the percentage of constituent-years with positive giving. As the number of titles viewed increases, the likelihood of having made a donation also increases. This suggests that engagement with PBS Utah content may be associated with a higher propensity to donate.
+
+## Section 8: AI Usage Note
+
+While I directed the structure of the EDA and the project requirements, I used GitHub Copilot to assist in writing the R code for data cleaning, transformation, and visualization. Copilot suggested code snippets for data manipulation using dplyr and ggplot2, which I reviewed and modified to fit the specific requirements of this analysis. I reviewed all final output, pushed back to the AI agent when suggestions were not appropriate, and ensured that the final code met the project objectives. After finishing the EDA, I also used a separate AI agent to independently review the code for any potential inaccuracies, ensuring an un-biased and thorough validation of the analysis. The AI agents were used as coding assistants, not as decision-makers, and all final decisions regarding data handling, analysis, and interpretation were made by me.
